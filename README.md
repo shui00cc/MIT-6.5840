@@ -14,6 +14,8 @@ MapReduce论文中文翻译：[MIT 6.5840 Lab1 - MapReduce-CSDN博客](https://b
 
 ## Lab1: MapReduce
 
+### 题目信息
+
 Lab1官网：[6.5840 Lab 1: MapReduce (mit.edu)](https://pdos.csail.mit.edu/6.824/labs/lab-mr.html)
 
 #### 例子
@@ -38,25 +40,29 @@ more mr-out-0
 #### 任务
 
 - 分布式的 MapReduce, 由 coordinate 和 worker 组成；
+
 - 一个 coordinate 进程和一个或多个并行执行的 worker 进程；
+
 - 通过 RPC 对话；
+
 - 每个 worker 进程将向 coordinate 请求一个任务，从一个或多个文件中读取任务的输入，执行任务，并将任务的输出写入一个或多个文件；
+
 - coordinate 需要注意一个 worker 如果在10s内没有完成它的任务，则将相同的任务分配给其他的 worker 。    
 
-- 参考： main/mrcoordinator.go main/mrworker.go
+- 主进程代码： main/mrcoordinator.go main/mrworker.go (仅使用，不作修改)
 
 - 完成： mr/coordinator.go mr/worker.go mr/rpc.go
 
 - 运行：
 
-         ```powershell
-         go build -buildmode=plugin ../mrapps/wc.go
-         rm mr-out*
-         go run mrcoordinator.go pg-*.txt
-         ---< In one or more other windows, run some workers: >---
-         go run mrworker.go wc.so
-         cat mr-out-* | sort | more
-         ```
+  ```powershell
+  go build -buildmode=plugin ../mrapps/wc.go
+  rm mr-out*
+  go run mrcoordinator.go pg-*.txt
+  ---< In one or more other windows, run some workers: >---
+  go run mrworker.go wc.so
+  cat mr-out-* | sort | more
+  ```
 
 - 测试：
 
@@ -136,3 +142,360 @@ more mr-out-0
 
   在调用之前不设置 reply 的任何字段。如果传递具有非默认字段的 reply 结构体，RPC 系统可能会在不提醒的情况下返回不正确的值。
 
+### 我的实现
+
+#### rpc.go
+
+首先在rpc.go中定义RPC通信需要的结构体字段，分别是args和reply
+
+```go
+type WorkerArgs struct {
+	MapTaskNumber    int // finished map task number
+	ReduceTaskNumber int // finished reduce task number
+}
+
+type WorkerReply struct {
+	TaskType         int    // 0:map task 1:reduce task 2:waiting 3:finished
+	NMap             int    // total num of map task
+	NReduce          int    // total num of reduce task
+	MapTaskNumber    int    // number of map task
+	ReduceTaskNumber int  	// number of reduce task 
+	Filename         string // filename for worker to map
+}
+```
+
+#### coordinator.go
+
+为了避免"magic number"(在代码中直接使用未解释的常数值)，可以为上面的WorkerReply中的TaskType定义常量：
+
+```go
+const (
+	TaskMap int = iota
+	TaskReduce
+	TaskWaiting
+	TaskFinished
+)
+```
+
+然后我们需要实现 Coordinator 结构体，我设置了如下字段：
+
+```go
+type Coordinator struct {
+	// Your definitions here.
+	nMap             int      // total num of map task
+	nReduce          int      // total num of reduce task
+	mapFinished      int      // number of finished map task
+	reduceFinished   int      // number of finished reduce task
+	mapTaskStatus    []int    // status array for map task
+	reduceTaskStatus []int    // status array for reduce task
+	files            []string // input files
+	mu               sync.Mutex
+}
+```
+
+上面的 xxxTaskStatus 数组用于维持每个任务的状态，定义以下状态的常量：
+
+```go
+const (
+	StatusNotAllocated int = iota
+	StatusWaiting
+	StatusFinished
+)
+```
+
+接着，我们需要实现RPC处理函数，提供给 worker 调用。首先是任务完成的函数，注意加锁以及defer解锁：
+
+```go
+func (c *Coordinator) ReceiveFinishedMap(args *WorkerArgs, reply *WorkerReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mapFinished++
+	c.mapTaskStatus[args.MapTaskNumber] = StatusFinished
+	return nil
+}
+
+func (c *Coordinator) ReceiveFinishedReduce(args *WorkerArgs, reply *WorkerReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reduceFinished++
+	c.reduceTaskStatus[args.ReduceTaskNumber] = StatusFinished
+	return nil
+}
+```
+
+最后是分配任务的RPC处理函数，代码逻辑如下：
+
+1. 当map任务尚未全部完成时，分配map任务
+
+   a. 通过mapTaskStatus[]寻找尚未分配的map任务并分配。如果任务全部已分配，则返回*TaskWaiting*状态
+
+   b. 分配任务后，**启动一个goroutine监听10s后任务是否完成**，如果仍未完成则重新分配此任务
+
+2. 当map任务全部完成后分配reduce，逻辑与上面的map相同
+
+3. 如果所有任务都已完成，返回*TaskFinished*状态
+
+```go
+func (c *Coordinator) AllocateTask(args *WorkerArgs, reply *WorkerReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.mapFinished < c.nMap {
+		// allocate new map task
+		allocate := -1
+		for i := 0; i < c.nMap; i++ {
+			if c.mapTaskStatus[i] == StatusNotAllocated {
+				allocate = i
+				break
+			}
+		}
+		if allocate == -1 {
+			reply.TaskType = TaskWaiting
+		} else {
+			reply.NReduce = c.nReduce
+			reply.TaskType = TaskMap
+			reply.MapTaskNumber = allocate
+			reply.Filename = c.files[allocate]
+			c.mapTaskStatus[allocate] = StatusWaiting
+			// 10s not finished
+			go func() {
+				select {
+				case <-time.After(10 * time.Second):
+					c.mu.Lock()
+					if c.mapTaskStatus[allocate] == StatusWaiting {
+						c.mapTaskStatus[allocate] = StatusNotAllocated
+					}
+					c.mu.Unlock()
+				}
+			}()
+		}
+	} else if c.mapFinished == c.nMap && c.reduceFinished < c.nReduce {
+		// all map task finished, allocate new reduce task
+		allocate := -1
+		for i := 0; i < c.nReduce; i++ {
+			if c.reduceTaskStatus[i] == StatusNotAllocated {
+				allocate = i
+				break
+			}
+		}
+		if allocate == -1 {
+			reply.TaskType = TaskWaiting
+		} else {
+			reply.NMap = c.nMap
+			reply.TaskType = TaskReduce
+			reply.ReduceTaskNumber = allocate
+			c.reduceTaskStatus[allocate] = StatusWaiting
+			// 10s not finished
+			go func() {
+				select {
+				case <-time.After(10 * time.Second):
+					c.mu.Lock()
+					if c.reduceTaskStatus[allocate] == StatusWaiting {
+						c.reduceTaskStatus[allocate] = StatusNotAllocated
+					}
+					c.mu.Unlock()
+				}
+			}()
+		}
+	} else {
+		// all finished
+		reply.TaskType = TaskFinished
+	}
+	return nil
+}
+```
+
+最后补全MakeCoordinator()函数，其提供了nReduce作为 reduce task 的数量：
+
+```go
+func MakeCoordinator(files []string, nReduce int) *Coordinator {
+	c := Coordinator{}
+
+	// Your code here.
+	c.files = files
+	c.nMap = len(files)
+	c.nReduce = nReduce
+	c.mapTaskStatus = make([]int, c.nMap)
+	c.reduceTaskStatus = make([]int, c.nReduce)
+
+	c.server()
+	return &c
+}
+```
+
+在Done中补充判断，以在mrcoordinator.go中退出时使用：
+
+```go
+func (c *Coordinator) Done() bool {
+	//ret := false
+
+	// Your code here.
+	ret := c.nReduce == c.reduceFinished
+	return ret
+}
+```
+
+#### worker.go
+
+首先和例子中wc.go一样，为我们自定义的ByKey结构体实现`sort.Sort(interface{})`需要的三个方法，以便后续排序直接使用：
+
+```go
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
+```
+
+然后实现最核心的Worker()方法，代码逻辑如下：
+
+首先通过RPC的call()调用 coordinator 的任务分配函数，获得回复后对`reply.TaskType`进行判断
+
+1. *TaskFinished*，任务全部完成，直接退出
+
+2. *TaskMap*
+
+   2.1 首先读取分配的文件并调用mapf函数，生成键值数组`var intermediate []KeyValue`
+
+   2.2 然后定义二维数组`buckets := make([][]KeyValue, reply.NReduce)`，将`intermediate`的内容append到指定序号的buckets[i]，使用`ihash(kva.Key)%reply.NReduce`作为分配的reduce任务序号i
+
+   2.3 **为了确保在整个写入操作完成之前，其他任务不会读取到不完整的文件**，我们使用提示中给出的`ioutil.TempFile`和`json.NewEncoder`来生成临时文件，临时文件写入完成后再重命名为中间文件mr-X-Y，X是当前map任务的序号，Y是当前的buckets[i]的i，即reduce的序号。
+
+   2.4 最后call 调用finishedxxx函数告诉 coordinator 此map任务已完成
+
+3. *TaskReduce*，从中间文件mr-X-Y中读取数据，临时文件操作同上，进行reduce操作的过程参考wc.go，最后也需调用finish函数
+
+4. TaskWaiting，执行`time.Sleep(time.*Second*)`等待
+
+```go
+func Worker(mapf func(string, string) []KeyValue,
+	reducef func(string, []string) string) {
+
+	// Your worker implementation here.
+
+	// uncomment to send the Example RPC to the coordinator.
+	// CallExample()
+	for {
+		args := WorkerArgs{}
+		reply := WorkerReply{}
+		ok := call("Coordinator.AllocateTask", &args, &reply)
+		if !ok || reply.TaskType == TaskFinished {
+			// coordinator died || job finished
+			break
+		}
+		if reply.TaskType == TaskMap {
+			// map task
+			intermediate := []KeyValue{}
+			file, err := os.Open(reply.Filename)
+			if err != nil {
+				log.Fatalf("cannot open %v: %v", reply.Filename, err)
+			}
+			content, err := ioutil.ReadAll(file)
+			if err != nil {
+				log.Fatalf("cannot read %v: %v", reply.Filename, err)
+			}
+			file.Close()
+			kva := mapf(reply.Filename, string(content))
+			intermediate = append(intermediate, kva...)
+
+			// hash into buckets
+			buckets := make([][]KeyValue, reply.NReduce)
+			for i := range buckets {
+				buckets[i] = []KeyValue{}
+			}
+			for _, kva := range intermediate {
+				buckets[ihash(kva.Key)%reply.NReduce] = append(buckets[ihash(kva.Key)%reply.NReduce], kva)
+			}
+
+			// write into intermediate files
+			for i := range buckets {
+				oname := fmt.Sprintf("mr-%d-%d", reply.MapTaskNumber, i)
+				ofile, _ := ioutil.TempFile("", oname+"*")
+				enc := json.NewEncoder(ofile)
+				for _, kva := range buckets[i] {
+					err := enc.Encode(&kva)
+					if err != nil {
+						log.Fatalf("cannot write into %v: %v", oname, err)
+					}
+				}
+				os.Rename(ofile.Name(), oname)
+				ofile.Close()
+			}
+
+			// call to send finish msg
+			finishedArgs := WorkerArgs{reply.MapTaskNumber, -1}
+			finishedReply := WorkerReply{}
+			call("Coordinator.ReceiveFinishedMap", &finishedArgs, &finishedReply)
+		} else if reply.TaskType == TaskReduce {
+			// reduce task
+			// collect Key-Value from mr-X-Y
+			intermediate := []KeyValue{}
+			for i := 0; i < reply.NMap; i++ {
+				iname := fmt.Sprintf("mr-%d-%d", i, reply.ReduceTaskNumber)
+				file, err := os.Open(iname)
+				if err != nil {
+					log.Fatalf("cannot open %v: %v", iname, err)
+				}
+				dec := json.NewDecoder(file)
+				for {
+					var kv KeyValue
+					if err := dec.Decode(&kv); err != nil {
+						break
+					}
+					intermediate = append(intermediate, kv)
+				}
+				file.Close()
+			}
+
+			// sort by key
+			sort.Sort(ByKey(intermediate))
+
+			// output file
+			oname := fmt.Sprintf("mr-out-%d", reply.ReduceTaskNumber)
+			ofile, _ := ioutil.TempFile("", oname+"*")
+
+			//
+			// call Reduce on each distinct key in intermediate[],
+			// and print the result to mr-out-0.
+			//
+			i := 0
+			for i < len(intermediate) {
+				j := i + 1
+				for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+					j++
+				}
+				values := []string{}
+				for k := i; k < j; k++ {
+					values = append(values, intermediate[k].Value)
+				}
+				output := reducef(intermediate[i].Key, values)
+
+				// this is the correct format for each line of Reduce output.
+				fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+				i = j
+			}
+			os.Rename(ofile.Name(), oname)
+			ofile.Close()
+
+			// delete intermediate files
+			for i := 0; i < reply.NMap; i++ {
+				iname := fmt.Sprintf("mr-%d-%d", i, reply.ReduceTaskNumber)
+				err := os.Remove(iname)
+				if err != nil {
+					log.Fatalf("cannot delete %v: %v", iname, err)
+				}
+			}
+
+			// call to send finish msg
+			finishedArgs := WorkerArgs{-1, reply.ReduceTaskNumber}
+			finishedReply := WorkerReply{}
+			call("Coordinator.ReceiveFinishedReduce", &finishedArgs, &finishedReply)
+		}
+		// else: reply.TaskType == TaskWaiting
+		time.Sleep(time.Second)
+	}
+	return
+}
+```

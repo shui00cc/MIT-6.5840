@@ -23,7 +23,20 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+// Capital letters!
+type WorkerArgs struct {
+	MapTaskNumber    int // finished map task number
+	ReduceTaskNumber int // finished reduce task number
+}
 
+type WorkerReply struct {
+	TaskType         int    // 0:map task 1:reduce task 2:waiting 3:finished
+	NMap             int    // total num of map task
+	NReduce          int    // total num of reduce task
+	MapTaskNumber    int    // number of map task
+	ReduceTaskNumber int    // number of reduce task
+	Filename         string // filename for worker to map
+}
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the coordinator.
