@@ -155,6 +155,8 @@ func (c *Coordinator) Done() bool {
 	//ret := false
 
 	// Your code here.
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	ret := c.nReduce == c.reduceFinished
 	return ret
 }
